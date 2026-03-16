@@ -1,10 +1,10 @@
+import sys
 import pdfplumber
 import pickle
 import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
-PDF_PATH = "Data/NIPS.pdf"
 CHUNK_SIZE = 500
 CHUNK_OVERLAP = 50
 
@@ -14,7 +14,11 @@ def extract_text(pdf_path):
         for i, page in enumerate(pdf.pages):
             text = page.extract_text()
             if text:
-                pages.append({"text": text, "page": i + 1})
+                pages.append({
+                    "text": text,
+                    "page": i + 1,
+                    "source": pdf_path
+                })
     return pages
 
 def chunk_text(pages, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
@@ -22,11 +26,16 @@ def chunk_text(pages, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
     for page in pages:
         text = page["text"]
         page_num = page["page"]
+        source = page["source"]
         start = 0
         while start < len(text):
             end = start + chunk_size
             chunk = text[start:end]
-            chunks.append({"text": chunk, "page": page_num})
+            chunks.append({
+                "text": chunk,
+                "page": page_num,
+                "source": source
+            })
             start = end - overlap
     return chunks
 
@@ -45,6 +54,14 @@ def save_to_faiss(chunks, embeddings):
         pickle.dump(chunks, f)
     print(f"Saved {len(chunks)} chunks to FAISS index")
 
+if len(sys.argv) < 2:
+    print("Usage: python ingest.py <path_to_pdf>")
+    print("Example: python ingest.py Data/NIPS.pdf")
+    sys.exit(1)
+
+PDF_PATH = sys.argv[1]
+
+print(f"Processing: {PDF_PATH}")
 print("Step 1: Extracting text from PDF...")
 pages = extract_text(PDF_PATH)
 print(f"Extracted {len(pages)} pages")
@@ -59,4 +76,7 @@ embeddings = embed_chunks(chunks)
 print("Step 4: Saving to FAISS...")
 save_to_faiss(chunks, embeddings)
 
-print("Done! Your PDF has been ingested successfully.")
+print(f"Done! {PDF_PATH} has been ingested successfully.")
+
+
+
