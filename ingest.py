@@ -1,82 +1,241 @@
-import sys
-import pdfplumber
+"""
+ingest.py
+Handles everything related to PDF ingestion:
+  - Text extraction (PyMuPDF + pdfplumber fallback + OCR fallback)
+  - Caching (MD5 hash-based)
+  - Sentence-aware chunking with overlap (fixes missed concepts)
+  - Embedding (sentence-transformers, normalised for cosine similarity)
+  - Building FAISS + BM25 hybrid index
+"""
+
+import os
+import io
+import re
 import pickle
-import faiss
+import hashlib
+import concurrent.futures
+
+import fitz                          # PyMuPDF
+import pdfplumber
+import pytesseract
 import numpy as np
+import faiss
+from PIL import Image
 from sentence_transformers import SentenceTransformer
+from rank_bm25 import BM25Okapi
 
-CHUNK_SIZE = 500
-CHUNK_OVERLAP = 50
+# ── Constants ──────────────────────────────────────────────────────────────────
+# Larger chunks = more context per chunk = fewer split concepts
+CHUNK_SIZE    = 1200   # chars (was 700 — too small, split concepts mid-sentence)
+CHUNK_OVERLAP = 200    # chars (was 70 — too small, context lost at boundaries)
+CACHE_DIR     = "pdf_cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
 
-def extract_text(pdf_path):
-    pages = []
-    with pdfplumber.open(pdf_path) as pdf:
-        for i, page in enumerate(pdf.pages):
-            text = page.extract_text()
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  1. HASHING
+# ─────────────────────────────────────────────────────────────────────────────
+def compute_hash(file_bytes: bytes) -> str:
+    return hashlib.md5(file_bytes).hexdigest()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  2. OCR FALLBACK
+# ─────────────────────────────────────────────────────────────────────────────
+def ocr_page(page, idx: int) -> tuple:
+    pix = page.get_pixmap(dpi=150)
+    img = Image.open(io.BytesIO(pix.tobytes("png")))
+    text = pytesseract.image_to_string(img)
+    return idx, text.strip()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  3. TEXT EXTRACTION
+# ─────────────────────────────────────────────────────────────────────────────
+def extract_text(pdf_path: str, source_name: str, progress_callback=None) -> list:
+    """
+    Three-layer extraction: PyMuPDF → pdfplumber → Tesseract OCR.
+    Results cached by MD5 so re-uploads are instant.
+    """
+    with open(pdf_path, "rb") as f:
+        raw = f.read()
+
+    file_hash  = compute_hash(raw)
+    cache_path = os.path.join(CACHE_DIR, f"{file_hash}.pkl")
+
+    if os.path.exists(cache_path):
+        with open(cache_path, "rb") as cf:
+            return pickle.load(cf)
+
+    doc   = fitz.open(pdf_path)
+    total = len(doc)
+    pages = [None] * total
+
+    def process_page(i):
+        page = doc[i]
+        # Layer 1: PyMuPDF (fast)
+        text = page.get_text().strip()
+        if text:
+            return i, text
+        # Layer 2: pdfplumber (better on complex layouts)
+        try:
+            with pdfplumber.open(pdf_path) as plumb:
+                pl_text = plumb.pages[i].extract_text()
+                if pl_text and pl_text.strip():
+                    return i, pl_text.strip()
+        except Exception:
+            pass
+        # Layer 3: OCR (scanned pages)
+        return ocr_page(page, i)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count()) as ex:
+        futures = [ex.submit(process_page, i) for i in range(total)]
+        for done, future in enumerate(concurrent.futures.as_completed(futures)):
+            idx, text = future.result()
             if text:
-                pages.append({
-                    "text": text,
-                    "page": i + 1,
-                    "source": pdf_path
-                })
+                pages[idx] = {"text": text, "page": idx + 1, "source": source_name}
+            if progress_callback:
+                progress_callback((done + 1) / total)
+
+    doc.close()
+    pages = [p for p in pages if p]
+
+    with open(cache_path, "wb") as cf:
+        pickle.dump(pages, cf)
+
     return pages
 
-def chunk_text(pages, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  4. SENTENCE-AWARE CHUNKING
+#  Key fix for Issue 1: respect sentence boundaries so concepts are never
+#  split mid-sentence across chunk edges.
+# ─────────────────────────────────────────────────────────────────────────────
+def _split_sentences(text: str) -> list:
+    """Split text into sentences using punctuation boundaries."""
+    # Split on . ! ? followed by whitespace or end-of-string
+    parts = re.split(r'(?<=[.!?])\s+', text.strip())
+    return [p.strip() for p in parts if p.strip()]
+
+
+def chunk_pages(pages: list,
+                chunk_size: int  = CHUNK_SIZE,
+                overlap: int     = CHUNK_OVERLAP) -> list:
+    """
+    Sentence-aware chunking with sliding window overlap.
+
+    Instead of blindly cutting every 700 chars (which splits sentences),
+    we accumulate sentences until we hit chunk_size, then slide back
+    by `overlap` chars worth of sentences for the next chunk.
+
+    This ensures:
+    - No concept is cut mid-sentence
+    - Overlapping context catches terms near chunk boundaries
+    - Each chunk has its source PDF and page number tracked
+    """
     chunks = []
-    for page in pages:
-        text = page["text"]
-        page_num = page["page"]
-        source = page["source"]
-        start = 0
-        while start < len(text):
-            end = start + chunk_size
-            chunk = text[start:end]
+
+    for p in pages:
+        sentences = _split_sentences(p["text"])
+        if not sentences:
+            continue
+
+        current_chunk   = []
+        current_length  = 0
+
+        for sentence in sentences:
+            sentence_len = len(sentence) + 1  # +1 for space
+
+            # If adding this sentence exceeds chunk_size AND we already
+            # have content, save current chunk and start a new one
+            if current_length + sentence_len > chunk_size and current_chunk:
+                chunk_text = " ".join(current_chunk)
+                chunks.append({
+                    "text":   chunk_text,
+                    "page":   p["page"],
+                    "source": p["source"],
+                })
+
+                # Slide back: keep sentences from the end that fit in overlap
+                overlap_chunk  = []
+                overlap_length = 0
+                for s in reversed(current_chunk):
+                    s_len = len(s) + 1
+                    if overlap_length + s_len <= overlap:
+                        overlap_chunk.insert(0, s)
+                        overlap_length += s_len
+                    else:
+                        break
+
+                current_chunk  = overlap_chunk
+                current_length = overlap_length
+
+            current_chunk.append(sentence)
+            current_length += sentence_len
+
+        # Don't forget the last chunk
+        if current_chunk:
             chunks.append({
-                "text": chunk,
-                "page": page_num,
-                "source": source
+                "text":   " ".join(current_chunk),
+                "page":   p["page"],
+                "source": p["source"],
             })
-            start = end - overlap
+
     return chunks
 
-def embed_chunks(chunks):
-    model = SentenceTransformer("all-MiniLM-L6-v2")
-    texts = [chunk["text"] for chunk in chunks]
-    embeddings = model.encode(texts, show_progress_bar=True)
-    return embeddings
 
-def save_to_faiss(chunks, embeddings):
-    dimension = embeddings.shape[1]
-    index = faiss.IndexFlatL2(dimension)
-    index.add(np.array(embeddings))
-    faiss.write_index(index, "faiss_index.bin")
-    with open("chunks.pkl", "wb") as f:
-        pickle.dump(chunks, f)
-    print(f"Saved {len(chunks)} chunks to FAISS index")
-
-if len(sys.argv) < 2:
-    print("Usage: python ingest.py <path_to_pdf>")
-    print("Example: python ingest.py Data/NIPS.pdf")
-    sys.exit(1)
-
-PDF_PATH = sys.argv[1]
-
-print(f"Processing: {PDF_PATH}")
-print("Step 1: Extracting text from PDF...")
-pages = extract_text(PDF_PATH)
-print(f"Extracted {len(pages)} pages")
-
-print("Step 2: Chunking text...")
-chunks = chunk_text(pages)
-print(f"Created {len(chunks)} chunks")
-
-print("Step 3: Generating embeddings...")
-embeddings = embed_chunks(chunks)
-
-print("Step 4: Saving to FAISS...")
-save_to_faiss(chunks, embeddings)
-
-print(f"Done! {PDF_PATH} has been ingested successfully.")
+# ─────────────────────────────────────────────────────────────────────────────
+#  5. EMBEDDING
+# ─────────────────────────────────────────────────────────────────────────────
+def embed_chunks(chunks: list, model: SentenceTransformer) -> np.ndarray:
+    """
+    Cosine-similarity embeddings.
+    normalize_embeddings=True → unit vectors → IndexFlatIP = cosine similarity.
+    """
+    texts = [c["text"] for c in chunks]
+    embeddings = model.encode(
+        texts,
+        show_progress_bar=False,
+        normalize_embeddings=True,
+        batch_size=64,
+    )
+    return np.array(embeddings, dtype=np.float32)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  6. BUILD HYBRID INDEX
+# ─────────────────────────────────────────────────────────────────────────────
+def _tokenize(text: str) -> list:
+    return re.findall(r'\w+', text.lower())
 
+
+def build_hybrid_index(chunks: list, model: SentenceTransformer) -> tuple:
+    """
+    Build FAISS (cosine) + BM25 indexes over all chunks from all PDFs.
+    Both indexes share the same chunk list so indices align perfectly.
+    """
+    # Dense index
+    embeddings  = embed_chunks(chunks, model)
+    dim         = embeddings.shape[1]
+    faiss_index = faiss.IndexFlatIP(dim)
+    faiss_index.add(embeddings)
+
+    # Sparse index
+    tokenized  = [_tokenize(c["text"]) for c in chunks]
+    bm25_index = BM25Okapi(tokenized)
+
+    return faiss_index, bm25_index, chunks
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  7. PIPELINE ENTRY POINT
+# ─────────────────────────────────────────────────────────────────────────────
+def ingest_pdf(pdf_path: str, source_name: str, model: SentenceTransformer,
+               progress_callback=None) -> tuple:
+    """
+    Full pipeline for a single PDF: extract → chunk.
+    build_hybrid_index() is called once after ALL PDFs are ingested.
+    """
+    pages  = extract_text(pdf_path, source_name, progress_callback)
+    chunks = chunk_pages(pages)
+    return pages, chunks
