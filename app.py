@@ -321,11 +321,15 @@ Available documents: {sources_str}
 
 Rules:
 - Answer using ONLY the context provided below.
-- If the answer spans multiple documents, reference each one clearly.
-- If the answer is NOT in the context, say exactly: "This information was not found in the provided documents."
-- Do NOT say "I don't know" — instead explain which documents were searched.
-- Be specific and cite the source document and page for key facts.
-- When listing items (like projects, skills, certifications), list ALL of them found in the context.
+- Give a clean, direct answer. Do NOT mention source filenames, page numbers,
+  or document names in your answer — a separate Sources panel already shows that.
+- Use reasoning and inference — if the user asks for a "title" or "heading", 
+  look for the most prominent text at the top of the document, even if the 
+  word "title" doesn't appear explicitly.
+- Only say "This information was not found" if the context genuinely contains 
+  nothing relevant at all — not just because the exact keyword is missing.
+- Do NOT contradict yourself by saying info is missing then providing it.
+- When listing items (like projects, skills, certifications), list ALL of them.
   Do NOT stop after the first one. Be exhaustive and complete.
 
 Context:
