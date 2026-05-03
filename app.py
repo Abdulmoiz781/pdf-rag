@@ -20,7 +20,8 @@ from retriever import hybrid_retrieve
 apply_styles()
 
 load_dotenv(override=True)
-client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+#client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+client = Groq(api_key=st.secrets["GROQ_API_KEY"])
 
 
 @st.cache_resource
