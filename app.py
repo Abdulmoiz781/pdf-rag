@@ -29,6 +29,7 @@ try:
     api_key = st.secrets["GROQ_API_KEY"]
 except Exception:
     api_key = os.environ.get("GROQ_API_KEY")
+st.write("KEY LOADED:", bool(api_key))
 client = Groq(api_key=api_key)
 
 
