@@ -27,9 +27,13 @@ apply_styles()
 
 try:
     api_key = st.secrets["GROQ_API_KEY"]
-except Exception:
-    api_key = os.environ.get("GROQ_API_KEY")
-st.write("KEY LOADED:", bool(api_key))
+except KeyError:
+    api_key = os.getenv("GROQ_API_KEY")
+
+if not api_key:
+    st.error("❌ GROQ_API_KEY not found. Please set it in Streamlit secrets.")
+    st.stop()
+
 client = Groq(api_key=api_key)
 
 
