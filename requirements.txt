@@ -7,3 +7,4 @@ rank-bm25
 pyspellchecker
 pymupdf
 pdfplumber
+pytesseract
