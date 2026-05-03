@@ -8,3 +8,6 @@ pyspellchecker
 pymupdf
 pdfplumber
 pytesseract
+numpy
+pillow
+torchvision
