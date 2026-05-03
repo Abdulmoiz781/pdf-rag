@@ -6,3 +6,4 @@ faiss-cpu
 rank-bm25
 pyspellchecker
 pymupdf
+pdfplumber
