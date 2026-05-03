@@ -19,10 +19,16 @@ from retriever import hybrid_retrieve
 
 apply_styles()
 
-load_dotenv(override=True)
-#client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-#client = Groq(api_key=st.secrets["GROQ_API_KEY"])
-api_key = st.secrets.get("GROQ_API_KEY") or os.environ.get("GROQ_API_KEY")
+# load_dotenv(override=True)
+# #client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+# #client = Groq(api_key=st.secrets["GROQ_API_KEY"])
+# api_key = st.secrets.get("GROQ_API_KEY") or os.environ.get("GROQ_API_KEY")
+# client = Groq(api_key=api_key)
+
+try:
+    api_key = st.secrets["GROQ_API_KEY"]
+except Exception:
+    api_key = os.environ.get("GROQ_API_KEY")
 client = Groq(api_key=api_key)
 
 
